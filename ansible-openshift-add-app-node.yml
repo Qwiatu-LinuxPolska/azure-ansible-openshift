@@ -1,0 +1,135 @@
+---
+- name: Deploying new vm to OpenShift on Azure
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    rg_name: "ocplinuxpolska"
+    rg_location: "eastus"
+    vnet_name: "openshiftvnet"
+    vnet_subnet_name: "nodesubnet"
+    vm_name: "s1"
+    vm_user: "ocpadmin"
+    vm_passwd: "Welcome201803@"
+    ssh_public_key: "ssh-rsa AAAAB3NzaC1yc2E...HjJDpJXPmX6+oTtpJlx vagrant@localhost.localdomain"
+    vm_deployment_public_ip: "52.168.110.82"
+    vm_deployment_ssh_port: "2200"
+    vm_deployment_user: "ocpadmin"
+  tasks:
+    - name: add_host - Adding deployment node to ansible inventory
+      add_host:
+        name: deployment-node
+        ansible_user: "{{ vm_deployment_user }}"
+        ansible_port: "{{ vm_deployment_ssh_port }}"
+        ansible_host: "{{ vm_deployment_public_ip }}"
+
+    - name: ping - checking  {{ vm_deployment_public_ip }} is pingable
+      ping:
+      delegate_to: deployment-node
+                
+    - name: azure_rm_virtualmachine - create {{ vm_name }} virtual machine
+      azure_rm_virtualmachine:
+        name: "{{ vm_name }}"
+        ssh_password_enabled: false
+        ssh_public_keys:
+          - path: "/home/{{ vm_user }}/.ssh/authorized_keys"
+            key_data: "{{ ssh_public_key }}"
+        admin_username: "{{ vm_user }}"
+        admin_password: "{{ vm_passwd }}"
+        virtual_network_name: "{{ vnet_name }}"
+        subnet_name: "{{ vnet_subnet_name }}"
+        managed_disk_type: Standard_LRS
+        image:
+          offer: "CentOS"
+          publisher: "OpenLogic"
+          sku: "7.4"
+          version: "latest"
+        resource_group: "{{ rg_name }}"
+        vm_size: "Standard_DS2_v2"
+        data_disks:
+          - lun: 0
+            disk_size_gb: 64
+            managed_disk_type: Standard_LRS
+        state: present
+      register: vm_creation
+      
+    - name: block - Preparing virtual machine
+      block:
+        - name: azure_rm_virtualmachine_extension - Prepare {{ vm_name }} node to use with OpenShift
+          azure_rm_virtualmachine_extension:
+            name: myvmextension
+            location: "{{ rg_location }}"
+            resource_group: "{{ rg_name }}"
+            virtual_machine_name: "{{ vm_name }}"
+            publisher: Microsoft.Azure.Extensions
+            type_handler_version: 2.0
+            auto_upgrade_minor_version: true
+            virtual_machine_extension_type: CustomScript
+            settings: '{"commandToExecute": "yum install wget git net-tools bind-utils iptables-services bridge-utils bash-completion kexec-tools sos psacct ansible pyOpenSSL docker -y &&
+            printf \"DEVS=$(parted -l 2>&1 | grep -i error | cut -d \":\" -f 2 | tr -d \" \")\nVG=docker-vg\n\" > /etc/sysconfig/docker-storage-setup &&
+            docker-storage-setup &&
+            systemctl enable docker && systemctl start docker &&
+            echo \"{{ vm_user }} ALL=(ALL) NOPASSWD: ALL\" > /etc/sudoers.d/waagent &&
+            mkdir -p /etc/origin/node/ && touch /etc/origin/node/resolv.conf"}'
+            state: present
+
+
+        - name: azure_rm_virtualmachine_extension - Delete VM Extension
+          azure_rm_virtualmachine_extension:
+            name: myvmextension
+            location: "{{ rg_location }}"
+            resource_group: "{{ rg_name }}"
+            virtual_machine_name: "{{ vm_name }}"
+            state: absent
+            
+      when: vm_creation['changed']
+
+            
+    - name: block - Redirect operations to {{ vm_deployment_public_ip }}
+      block:
+        - name: "replace - {{ vm_deployment_public_ip }} - Remove exist entries {{ vm_name }} in /etc/ansible/hosts"
+          replace:
+           path: "/etc/ansible/hosts"
+           regexp: "{{ vm_name }} openshift_node_labels=\"{'type': 'app', 'zone': 'default'}\" openshift_hostname={{ vm_name }}"
+           replace: ""
+
+        - name: "lineinfile - {{ vm_deployment_public_ip }} - Adding entry {{ vm_name }} to [new_nodes] section in /etc/ansible/hosts"
+          lineinfile:
+           path: "/etc/ansible/hosts"
+           regexp: "^\\[new_nodes\\]"
+           line: |
+             [new_nodes]
+             {{ vm_name }} openshift_node_labels="{'type': 'app', 'zone': 'default'}" openshift_hostname={{ vm_name }}
+        
+        - name: "shell - {{ vm_deployment_public_ip }} - Adding {{ vm_name }} to OpenShift - Scale-out!!!"
+          shell:
+            ansible-playbook -i /etc/ansible/hosts openshift-ansible/playbooks/byo/openshift-node/scaleup.yml
+          become: false
+          
+        - name: "replace - {{ vm_deployment_public_ip }} - Remove exist entries {{ vm_name }} in /etc/ansible/hosts"
+          replace:
+           path: "/etc/ansible/hosts"
+           regexp: "{{ vm_name }} openshift_node_labels=\"{'type': 'app', 'zone': 'default'}\" openshift_hostname={{ vm_name }}"
+           replace: ""
+        
+          
+        - name: "lineinfile - {{ vm_deployment_public_ip }} - Adding entry {{ vm_name }} to [nodes] section in /etc/ansible/hosts"
+          lineinfile:
+           path: "/etc/ansible/hosts"
+           regexp: "^\\[nodes\\]"
+           line: |
+             [nodes]
+             {{ vm_name }} openshift_node_labels="{'type': 'app', 'zone': 'default'}" openshift_hostname={{ vm_name }}
+
+             
+      rescue:
+        - name: debug - exist errors!!
+          debug:
+            msg: "Remove manually {{ vm_name }} in Azure portal and run again  playbook. Do not forget remove disks"
+
+        
+      delegate_to: deployment-node
+      become: true
+      when: vm_creation['changed']
+        
+
